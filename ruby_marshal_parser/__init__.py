@@ -66,7 +66,7 @@ class MarshalFile:
         def recurse(node: Node) -> JsonDumpable:
             result: dict[str, JsonDumpable] = {}
 
-            node = node.deref()
+            node = node.deref
 
             if node in parents:
                 return {'type': 'parent-ref', 'value': parents[node]}
@@ -291,6 +291,7 @@ class Node:
             True_, False_, Nil, Fixnum, Symbol, SymbolRef, ObjectRef
         ))
 
+    @ft.cached_property
     def deref(self) -> 'Node':
         """Returns the referenced node, if the node is a reference node, and
         the node itself, otherwise.
@@ -326,6 +327,7 @@ class Node:
 
         return result
 
+    @ft.cached_property
     def body(self) -> 'Node':
         """Returns the extended node, if the node is an extension node, and the
         node itself, otherwise.
@@ -333,7 +335,7 @@ class Node:
         An extension node is one whose `content` is of type `InstVars` or
         `ModuleExt`."""
 
-        result = self.deref()
+        result = self.deref
 
         while True:
             match result.content:
@@ -346,14 +348,14 @@ class Node:
 
         return result
 
-    @ft.cached_property
+    @property
     def body_content(self) -> NodeData:
-        return self.body().content
+        return self.body.content
 
     @ft.cached_property
     def inst_vars(self) -> dict[str, 'Node']:
         result: dict[str, Node] = {}
-        node = self.deref()
+        node = self.deref
 
         while True:
             match node.content:
@@ -376,7 +378,7 @@ class Node:
     @ft.cached_property
     def module_ext(self) -> list[str]:
         result = []
-        node = self.deref()
+        node = self.deref
 
         while True:
             match node.content:
@@ -418,7 +420,7 @@ class Node:
         encoding_node = self.inst_vars.get('E')
         return None if encoding_node is None else encoding_node.as_encoding()
 
-    @ft.cached_property
+    @property
     def decoded_text(self) -> str:
         content = self.body_content
 
@@ -431,18 +433,6 @@ class Node:
 
         encoding = self.encoding()
         return content.text.decode('latin-1' if encoding is None else encoding)
-
-    @property
-    def symbol_text(self) -> str:
-        content = self.body_content
-
-        if not isinstance(content, Symbol):
-            raise DataError(
-                f'expected symbol node, got one of type '
-                f'{type(content).__name__}'
-            )
-
-        return self.decoded_text
 
     @property
     def body_type_and_content(self) -> NodeBodyTypeAndContent:
@@ -495,6 +485,34 @@ class Node:
                 assert False, (
                     f'node body has unexpected type {type(content).__name__}'
                 )
+
+    @property
+    def symbol_text(self) -> str:
+        content = self.body_content
+
+        if not isinstance(content, Symbol):
+            raise DataError(
+                f'expected symbol node, got one of type '
+                f'{type(content).__name__}'
+            )
+
+        return self.decoded_text
+
+    @property
+    def bool_value(self) -> bool:
+        content = self.body_content
+
+        match content:
+            case True_():
+                return True
+            case False_():
+                return False 
+            case _:
+                raise DataError(
+                    f'expected true or false node, got one of type '
+                    f'{type(content).__name__}'
+                )
+
 
 @dataclass(eq=False)
 class True_(NodeData):
@@ -963,26 +981,3 @@ def parse_stream(stream: io.IOBase) -> MarshalFile:
 def parse_file(path: Path) -> MarshalFile:
     with path.open('rb') as f:
         return parse_stream(f)
-
-
-if __name__ == '__main__':
-    import argparse
-    import json
-
-    arg_parser = argparse.ArgumentParser(
-        prog='ruby_marshal_parser',
-        description='Parses Ruby Marshal data files.'
-    )
-
-    arg_parser.add_argument('input_file', type=Path)
-    arg_parser.add_argument('output_file', type=Path)
-    parsed_args = arg_parser.parse_args()
-
-    with parsed_args.input_file.open('rb') as f:
-        raw_tree = parse_stream(f)
-
-    json_tree = json.dumps(raw_tree.to_json_dumpable(), indent=2)
-
-    with parsed_args.output_file.open('w') as f:
-        f.write(json_tree)
-    
