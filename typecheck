@@ -1,0 +1,1 @@
+env/bin/mypy ruby_marshal_parser.py --enable-incomplete-feature=NewGenericSyntax

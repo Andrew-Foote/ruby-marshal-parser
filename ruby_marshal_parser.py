@@ -1,22 +1,32 @@
-# iddain't preddy, buddit does the jawb
-
-from abc import ABC, ABCMeta
-from collections.abc import Sequence
-from dataclasses import dataclass
-from enum import Enum
+from abc import ABC
+from dataclasses import dataclass, field
+import functools as ft
 import io
-import json
 import locale
 import math
 from pathlib import Path
 import re
-import sys
+from typing import Callable, Literal, Iterator, Sequence, Mapping
 from warnings import warn
 
-class MarshalObject(ABC):
+
+def dfs[T](node: T, children: Callable[[T], Iterator[T]]) -> Iterator[T]:
+    yield node
+
+    for child in children(node):
+        yield from dfs(child, children)
+
+
+JsonDumpable = (
+    bool | None | int | float | str
+    | Sequence['JsonDumpable'] | Mapping[str, 'JsonDumpable']
+)
+
+
+class DataError(Exception):
     pass
 
-@dataclass
+@dataclass(frozen=True)
 class MarshalVersion:
     major: int
     minor: int
@@ -27,135 +37,689 @@ class MarshalVersion:
     def is_supported(self):
         return (self.major, self.minor) <= (4, 8)
 
-class MarshalNonToplevelObject(MarshalObject, metaclass=ABCMeta):
-    pass
+@dataclass(eq=False)
+class MarshalFile:
+    version: MarshalVersion=MarshalVersion(0, 0)
+    content: 'Node | None'=None
 
-class MarshalNonRefObject(MarshalObject, metaclass=ABCMeta):
-    pass
+    @ft.cached_property
+    def symbols(self) -> list['Node']:
+        assert self.content is not None
 
-@dataclass
-class MarshalFile(MarshalNonRefObject):
-    version: MarshalVersion
-    root: MarshalObject
+        return [
+            node for node in dfs(self.content, Node.children)
+            if node.can_be_symbol_ref_target()
+        ]
+
+    @ft.cached_property
+    def objects(self) -> list['Node']:
+        assert self.content is not None
+
+        return [
+            node for node in dfs(self.content, Node.children)
+            if node.can_be_object_ref_target()
+        ]
+
+    def to_json_dumpable(self) -> JsonDumpable:
+        parents: dict[Node, int] = {}
+
+        def recurse(node: Node) -> JsonDumpable:
+            result: dict[str, JsonDumpable] = {}
+
+            node = node.deref()
+
+            if node in parents:
+                return {'type': 'parent-ref', 'value': parents[node]}
+            
+            parents[node] = len(parents)
+
+            if node.module_ext:
+                result['module_ext'] = node.module_ext
+
+            content = node.body_content
+
+            match content:
+                case True_():
+                    result['type'] = 'true'
+                    result['value'] = True
+                case False_():
+                    result['type'] = 'false'
+                    result['value'] = False
+                case Nil():
+                    result['type'] = 'nil'
+                    result['value'] = None
+                case Fixnum(value):
+                    result['type'] = 'fixnum'
+                    result['value'] = value
+                case Symbol():
+                    result['type'] = 'symbol'
+                    result['value'] = node.decoded_text
+                case Array(items):
+                    result['type'] = 'array'
+                    result['value'] = list(map(recurse, items))
+                case Bignum(value):
+                    result['type'] = 'bignum'
+                    result['value'] = value
+                case ClassRef():
+                    result['type'] = 'class-ref'
+                    result['value'] = node.decoded_text
+                case ModuleRef():
+                    result['type'] = 'module-ref'
+                    result['value'] = node.decoded_text
+                case ClassOrModuleRef():
+                    result['type'] = 'class-or-module-ref'
+                    result['value'] = node.decoded_text
+                case Data(class_name=klass, state=state):
+                    result['type'] = 'data'
+                    result['class'] = klass
+                    result['state'] = recurse(state)
+                case Float(value):
+                    result['type'] = 'float'
+                    result['value'] = value
+                case Hash(items):
+                    result['type'] = 'hash'
+                    
+                    result['value'] = [
+                        (recurse(key), recurse(value)) for key, value in items
+                    ]
+                case DefaultHash(items, default):
+                    result['type'] = 'hash'
+                    
+                    result['value'] = [
+                        (recurse(key), recurse(value)) for key, value in items
+                    ]
+
+                    result['default'] = recurse(default)
+                case Object(class_name=klass):
+                    result['type'] = 'object'
+                    result['class'] = klass
+                case Regex(options=options):
+                    result['type'] = 'regex'
+                    result['source'] = node.decoded_text
+                    result['options'] = [option.value for option in options]
+                case String():
+                    result['type'] = 'string'
+                    result['value'] = node.decoded_text
+                case Struct(class_name=klass):
+                    result['type'] = 'struct'
+                    result['class'] = klass
+                case UserClass(class_name=klass, child=child):
+                    result['type'] = 'user-class'
+                    result['class'] = klass
+                    result['child'] = recurse(child)
+                case UserData(class_name=klass, data=data):
+                    result['type'] = 'user-data'
+                    result['class'] = klass
+                    result['data'] = data.decode('latin-1')
+                case UserObject(class_name=klass, child=child):
+                    result['type'] = 'user-object'
+                    result['class'] = klass
+                    result['child'] = recurse(child)
+                case _:
+                    assert False, (
+                        f'unrecognized node type: {type(content).__name__}'
+                    )
+
+            result['inst_vars'] = {
+                name: recurse(value)
+                for name, value in node.inst_vars.items()
+                if name != 'E'
+            }
+
+            del parents[node]
+
+            if not result['inst_vars']:
+                del result['inst_vars']
+
+            if (
+                result['type'] in (
+                    'nil', 'true', 'false', 'fixnum', 'array', 'float', 'string'
+                )
+                and 'module_ext' not in result and 'inst_vars' not in result
+            ):
+                actual_result = result['value']
+            else:
+                actual_result = result
+
+            return actual_result
+
+        if self.content is None:
+            assert False, 'MarshalFile not initialized'
+
+        return {
+            'version': str(self.version),
+            'content': recurse(self.content)
+        }
 
 @dataclass(eq=False)
-class MarshalNil(MarshalNonToplevelObject, MarshalNonRefObject):
+class NodeData(ABC):
     pass
 
-@dataclass(eq=False)
-class MarshalTrue(MarshalNonToplevelObject, MarshalNonRefObject):
-    pass
+NodeBodyTypeAndContent = (
+    tuple[Literal['T']] | tuple[Literal['F']]
+    | tuple[Literal['0']]
+    | tuple[Literal['i'], int]
+    | tuple[Literal[':'], str]
+    | tuple[Literal['['], list['Node']]
+    | tuple[Literal['l'], int]
+    | tuple[Literal['c'], str]
+    | tuple[Literal['m'], str]
+    | tuple[Literal['M'], str]
+    | tuple[Literal['d'], str, 'Node']
+    | tuple[Literal['f'], float]
+    | tuple[Literal['{'], list[tuple['Node', 'Node']]]
+    | tuple[Literal['}'], list[tuple['Node', 'Node']], 'Node']
+    | tuple[Literal['/'], str, set[re.RegexFlag]]
+    | tuple[Literal['"'], str]
+    | tuple[Literal['o'], str]
+    | tuple[Literal['S'], str]
+    | tuple[Literal['C'], str, 'Node']
+    | tuple[Literal['u'], str, bytes]
+    | tuple[Literal['U'], str, 'Node']
+)
 
 @dataclass(eq=False)
-class MarshalFalse(MarshalNonToplevelObject, MarshalNonRefObject):
-    pass
+class Node:
+    """A node in the parsed syntax tree."""
+
+    file: MarshalFile
+    content: NodeData
+
+    __match_args__ = 'body_type_and_content', 'inst_vars', 'module_ext'
+
+    def children(self) -> Iterator['Node']:
+        """Returns an iterator over the node's immediate children.
+
+        For extension nodes (whose `content` is of type `InstVarsData` or
+        `ModuleExtData`) the node corresponding to the extended object is not
+        considered an immediate child; instead, its children are included
+        among its parent's immediate children."""
+
+        content = self.content
+
+        match content:
+            case (
+                True_() | False_() | Nil() | Fixnum() | Symbol() | SymbolRef()
+                | ObjectRef() | Bignum() | Float() | Regex() | String()
+            ):
+                pass
+            case InstVars(child, members_list):
+                yield from child.children()
+
+                for key, value in members_list:
+                    yield key
+                    yield value 
+            case ModuleExt(module_node, child):
+                yield module_node
+                yield from child.children()
+            case Array(items):
+                yield from items
+            case Data(class_node, state):
+                yield class_node
+                yield state
+            case Hash(items):
+                for key, value in items:
+                    yield key
+                    yield value
+            case DefaultHash(items, default):
+                for key, value in items:
+                    yield key
+                    yield value
+
+                yield default
+            case Object(class_node, members) | Struct(class_node, members):
+                yield class_node
+
+                for key, value in members:
+                    yield key
+                    yield value
+            case UserClass(class_node, child) | UserObject(class_node, child):
+                yield class_node
+                yield child
+            case UserData(class_node, data):
+                yield class_node
+            case _:
+                assert False, (
+                    f'unrecognized node type {type(content).__name__}'
+                )
+
+    def can_be_symbol_ref_target(self) -> bool:
+        return isinstance(self.content, Symbol)
+
+    def can_be_object_ref_target(self) -> bool:
+        return not isinstance(self.content, (
+            True_, False_, Nil, Fixnum, Symbol, SymbolRef, ObjectRef
+        ))
+
+    def deref(self) -> 'Node':
+        """Returns the referenced node, if the node is a reference node, and
+        the node itself, otherwise.
+
+        A reference node is one whose `content` is of type `SymbolRef` or
+        `ObjectRef`."""
+
+        result = self
+        file = self.file
+
+        while True:
+            match result.content:
+                case SymbolRef(value):
+                    try:
+                        return file.symbols[value]
+                    except IndexError:
+                        raise DataError(
+                            'invalid symbol reference (referenced symbol '
+                            f'number {value}, but only {len(file.symbols)} '
+                            'symbols were found)'
+                        )
+                case ObjectRef(value):
+                    try:
+                        return file.objects[value]
+                    except IndexError:
+                        raise DataError(
+                            'invalid object reference (referenced object '
+                            f'number {value}, but only {len(file.objects)} '
+                            'objects were found)'
+                        )
+                case _:
+                    break
+
+        return result
+
+    def body(self) -> 'Node':
+        """Returns the extended node, if the node is an extension node, and the
+        node itself, otherwise.
+
+        An extension node is one whose `content` is of type `InstVars` or
+        `ModuleExt`."""
+
+        result = self.deref()
+
+        while True:
+            match result.content:
+                case InstVars(child):
+                    result = child
+                case ModuleExt(_, child):
+                    result = child
+                case _:
+                    break
+
+        return result
+
+    @ft.cached_property
+    def body_content(self) -> NodeData:
+        return self.body().content
+
+    @ft.cached_property
+    def inst_vars(self) -> dict[str, 'Node']:
+        result: dict[str, Node] = {}
+        node = self.deref()
+
+        while True:
+            match node.content:
+                case InstVars(child, members=members):
+                    result |= members
+                    node = child
+                case ModuleExt(_, child):
+                    node = child
+                case Object(_, members=members):
+                    result |= members
+                    break
+                case Struct(_, members=members):
+                    result |= members
+                    break
+                case _:
+                    break
+
+        return result
+
+    @ft.cached_property
+    def module_ext(self) -> list[str]:
+        result = []
+        node = self.deref()
+
+        while True:
+            match node.content:
+                case InstVars(child):
+                    node = child
+                case ModuleExt(module_name=module, child=child):
+                    result.append(module)
+                    node = child
+                case _:
+                    break
+
+        return result
+
+    def as_encoding(self) -> str:
+        match self.body_content:
+            case True_():
+                return 'utf-8'
+            case False_():
+                return 'us-ascii'
+            case String(value):
+                encoding_name = value.decode('utf-8')
+
+                try:
+                    b'\x00'.decode(encoding_name)
+                except LookupError:
+                    raise DataError(
+                        f"Ruby encoding name '{encoding_name}' is not "
+                        'understood by Python'
+                    )
+
+                return encoding_name
+            case _:
+                raise DataError(
+                    f"node of type {type(self).__name__} can't be interpreted "
+                    'as an encoding'
+                )
+
+    def encoding(self) -> str | None:
+        encoding_node = self.inst_vars.get('E')
+        return None if encoding_node is None else encoding_node.as_encoding()
+
+    @ft.cached_property
+    def decoded_text(self) -> str:
+        content = self.body_content
+
+        if not isinstance(content, (
+            Symbol, ClassRef, ModuleRef, ClassOrModuleRef, Regex, String
+        )):
+            raise DataError(
+                f'node of type {type(content).__name__} has no text to decode'
+            )
+
+        encoding = self.encoding()
+        return content.text.decode('latin-1' if encoding is None else encoding)
+
+    @property
+    def symbol_text(self) -> str:
+        content = self.body_content
+
+        if not isinstance(content, Symbol):
+            raise DataError(
+                f'expected symbol node, got one of type '
+                f'{type(content).__name__}'
+            )
+
+        return self.decoded_text
+
+    @property
+    def body_type_and_content(self) -> NodeBodyTypeAndContent:
+        content = self.body_content
+
+        match content:
+            case True_():
+                return 'T',
+            case False_():
+                return 'F',
+            case Nil():
+                return '0',
+            case Fixnum(value):
+                return 'i', value
+            case Symbol():
+                return ':', self.decoded_text
+            case Array(items):
+                return '[', items
+            case Bignum(value):
+                return 'l', value
+            case ClassRef():
+                return 'c', self.decoded_text
+            case ModuleRef():
+                return 'm', self.decoded_text
+            case ClassOrModuleRef():
+                return 'M', self.decoded_text
+            case Data(class_name=klass, state=state):
+                return 'd', klass, state
+            case Float(value):
+                return 'f', value
+            case Hash(items):
+                return '{', items
+            case DefaultHash(items, default):
+                return '}', items, default
+            case Object(class_name=klass):
+                return 'o', klass
+            case Regex(options=options):
+                return '/', self.decoded_text, options
+            case String():
+                return '"', self.decoded_text
+            case Struct(class_name=klass):
+                return 'S', klass
+            case UserClass(class_name=klass, child=child):
+                return 'C', klass, child
+            case UserData(class_name=klass, data=data):
+                return 'u', klass, data
+            case UserObject(class_name=klass, child=child):
+                return 'U', klass, child
+            case _:
+                assert False, (
+                    f'node body has unexpected type {type(content).__name__}'
+                )
 
 @dataclass(eq=False)
-class MarshalFixnum(MarshalNonToplevelObject, MarshalNonRefObject):
+class True_(NodeData):
+    TYPE_CODE = 'T'
+
+@dataclass(eq=False)
+class False_(NodeData):
+    TYPE_CODE = 'F'
+
+@dataclass(eq=False)
+class Nil(NodeData):
+    TYPE_CODE = '0'
+
+@dataclass(eq=False)
+class Fixnum(NodeData):
+    TYPE_CODE = 'i'
+
     value: int
 
 @dataclass(eq=False)
-class MarshalSymbol(MarshalNonToplevelObject, MarshalNonRefObject):
-    name: bytes
+class Symbol(NodeData):
+    TYPE_CODE = ':'
+
+    text: bytes
 
 @dataclass(eq=False)
-class MarshalSymbolRef(MarshalNonToplevelObject):
+class SymbolRef(NodeData):
+    TYPE_CODE = ';'
+
     value: int
 
 @dataclass(eq=False)
-class MarshalObjectRef(MarshalNonToplevelObject):
-    value: int
+class ObjectRef(NodeData):
+    TYPE_CODE = '@'
 
-MarshalAlist = list[tuple['MarshalNonToplevelObject', 'MarshalNonToplevelObject']]
-
-@dataclass(eq=False)
-class MarshalInstVars(MarshalNonToplevelObject, MarshalNonRefObject):
-    obj: 'MarshalObject'
-    inst_vars: MarshalAlist
-
-@dataclass(eq=False)
-class MarshalModuleExt(MarshalNonToplevelObject, MarshalNonRefObject):
-    module: 'MarshalObject'
-    obj: 'MarshalObject'
-
-@dataclass(eq=False)
-class MarshalArray(MarshalNonToplevelObject, MarshalNonRefObject):
-    items: list['MarshalNonToplevelObject']
-
-@dataclass(eq=False)
-class MarshalBignum(MarshalNonToplevelObject, MarshalNonRefObject):
     value: int
 
 @dataclass(eq=False)
-class MarshalClassRef(MarshalNonToplevelObject, MarshalNonRefObject):
-    name: bytes
+class InstVars(NodeData):
+    TYPE_CODE = 'I'
+
+    child: Node
+    members_list: list[tuple[Node, Node]]
+
+    @property
+    def members(self) -> dict[str, Node]:
+        return {name.symbol_text: value for name, value in self.members_list}
 
 @dataclass(eq=False)
-class MarshalModuleRef(MarshalNonToplevelObject, MarshalNonRefObject):
-    name: bytes
+class ModuleExt(NodeData):
+    TYPE_CODE = 'e'
+
+    module_node: Node
+    child: Node
+
+    @property
+    def module_name(self) -> str:
+        return self.module_node.symbol_text
 
 @dataclass(eq=False)
-class MarshalClassOrModuleRef(MarshalNonToplevelObject, MarshalNonRefObject):
-    name: bytes
+class Array(NodeData):
+    TYPE_CODE = '['
+
+    items: list['Node']
 
 @dataclass(eq=False)
-class MarshalData(MarshalNonToplevelObject, MarshalNonRefObject):
-    class_ref: 'MarshalObject'
-    state: 'MarshalObject'
+class Bignum(NodeData):
+    TYPE_CODE = 'l'
+
+    value: int
 
 @dataclass(eq=False)
-class MarshalFloat(MarshalNonToplevelObject, MarshalNonRefObject):
+class ClassRef(NodeData):
+    TYPE_CODE = 'c'
+
+    text: bytes
+
+@dataclass(eq=False)
+class ModuleRef(NodeData):
+    TYPE_CODE = 'm'
+
+    text: bytes
+
+@dataclass(eq=False)
+class ClassOrModuleRef(NodeData):
+    TYPE_CODE = 'M'
+
+    text: bytes
+
+@dataclass(eq=False)
+class Data(NodeData):
+    TYPE_CODE = 'd'
+
+    class_node: Node
+    state: Node
+
+    @property
+    def class_name(self) -> str:
+        return self.class_node.symbol_text
+
+@dataclass(eq=False)
+class Float(NodeData):
+    TYPE_CODE = 'f'
+
     value: float
 
 @dataclass(eq=False)
-class MarshalHash(MarshalNonToplevelObject, MarshalNonRefObject):
-    items: MarshalAlist
+class Hash(NodeData):
+    TYPE_CODE = '{'
+    
+    items: list[tuple[Node, Node]]
 
 @dataclass(eq=False)
-class MarshalDefaultHash(MarshalNonToplevelObject, MarshalNonRefObject):
-    items: MarshalAlist
-    default: 'MarshalObject'
+class DefaultHash(NodeData):
+    TYPE_CODE = '}'
+    
+    items: list[tuple[Node, Node]]
+    default: Node
 
 @dataclass(eq=False)
-class MarshalGenObject(MarshalNonToplevelObject, MarshalNonRefObject):
-    class_ref: 'MarshalObject'
-    inst_vars: MarshalAlist
+class Object(NodeData):
+    TYPE_CODE = 'o'
+
+    class_node: Node
+    members_list: list[tuple[Node, Node]]
+
+    @property
+    def class_name(self) -> str:
+        return self.class_node.symbol_text
+
+    @property
+    def members(self) -> dict[str, Node]:
+        return {name.symbol_text: value for name, value in self.members_list}
 
 @dataclass(eq=False)
-class MarshalRegex(MarshalNonToplevelObject, MarshalNonRefObject):
-    source: bytes
-    options: set[re.RegexFlag]
+class Regex(NodeData):
+    TYPE_CODE = '/'
+    REGEX_OPTIONS = [re.I, re.X, re.M]
+
+    text: bytes
+    options_byte: int
+
+    @property
+    def options(self) -> set[re.RegexFlag]:
+        result = set()
+        bits = self.options_byte
+
+        for i in range(8):
+            bits, is_set = divmod(bits, 2)
+            
+            if is_set:
+                try:
+                    option = self.REGEX_OPTIONS[i]
+                except IndexError:
+                    raise DataError(
+                        f"regex options byte (value {bits}) has {i}th bit set "
+                        "but this does not correspond to a recognized option"
+                    )
+                else:
+                    result.add(option)
+
+        return result
 
 @dataclass(eq=False)
-class MarshalString(MarshalNonToplevelObject, MarshalNonRefObject):
-    value: bytes
+class String(NodeData):
+    TYPE_CODE = '"'
+
+    text: bytes
 
 @dataclass(eq=False)
-class MarshalStruct(MarshalNonToplevelObject, MarshalNonRefObject):
-    class_ref: 'MarshalObject'
-    members: MarshalAlist
+class Struct(NodeData):
+    TYPE_CODE = 'S'
+
+    class_node: Node
+    members_list: list[tuple[Node, Node]]
+
+    @property
+    def class_name(self) -> str:
+        return self.class_node.symbol_text
+
+    @property
+    def members(self) -> dict[str, Node]:
+        return {name.symbol_text: value for name, value in self.members_list}
 
 @dataclass(eq=False)
-class MarshalUserClass(MarshalNonToplevelObject, MarshalNonRefObject):
-    class_ref: 'MarshalObject'
-    obj: 'MarshalObject'
+class UserClass(NodeData):
+    TYPE_CODE = 'C'
+
+    class_node: Node
+    child: Node
+
+    @property
+    def class_name(self) -> str:
+        return self.class_node.symbol_text
 
 @dataclass(eq=False)
-class MarshalUserData(MarshalNonToplevelObject, MarshalNonRefObject):
-    class_ref: 'MarshalObject'
+class UserData(NodeData):
+    TYPE_CODE = 'u'
+    
+    class_node: Node
     data: bytes
 
-@dataclass(eq=False)
-class MarshalUserObject(MarshalNonToplevelObject, MarshalNonRefObject):
-    class_ref: 'MarshalObject'
-    obj: 'MarshalObject'
+    @property
+    def class_name(self) -> str:
+        return self.class_node.symbol_text
 
-class ParserError(ValueError):
+@dataclass(eq=False)
+class UserObject(NodeData):
+    TYPE_CODE = 'U'
+
+    class_node: Node
+    child: Node
+
+    @property
+    def class_name(self) -> str:
+        return self.class_node.symbol_text
+
+
+class ParserError(Exception):
     pass
 
 @dataclass
 class Parser:
-    stream: io.BufferedIOBase
+    stream: io.IOBase
+    result: MarshalFile=field(default_factory=lambda: MarshalFile())
 
     def offset(self) -> int:
         return self.stream.tell()
@@ -182,75 +746,79 @@ class Parser:
                 "supported"
             )
 
-        root = self.read_object()
+        self.result.version = version
+        self.result.content = self.read_object()
 
-        if self.stream.read1():
+        if self.stream.read(1):
             warn(
                 f"finished parsing at offset {self.offset()}, but the input "
                 "file does not end here"
             )
 
-        return MarshalFile(version, root)
+        return self.result
 
-    def read_object(self) -> MarshalNonToplevelObject:
+    def read_object(self) -> Node:
         code = chr(self.read_byte())
-        
+        content: NodeData
+
         match code:
-            case '0':
-                return MarshalNil()
             case 'T':
-                return MarshalTrue()
+                content = True_()
             case 'F':
-                return MarshalFalse()
+                content = False_()
+            case '0':
+                content = Nil()
             case 'i':
-                return MarshalFixnum(self.read_long())
+                content = Fixnum(self.read_long())
             case ':':
-                return MarshalSymbol(self.read_byte_seq())
+                content = Symbol(self.read_byte_seq())
             case ';':
-                return MarshalSymbolRef(self.read_long())
+                content = SymbolRef(self.read_long())
             case '@':
-                return MarshalObjectRef(self.read_long())
+                content = ObjectRef(self.read_long())
             case 'I':
-                return self.read_object_with_inst_vars()
+                content = self.read_object_with_inst_vars()
             case 'e':
-                return self.read_object_with_module_ext()
+                content = self.read_object_with_module_ext()
             case '[':
-                return self.read_array()
+                content = self.read_array()
             case 'l':
-                return self.read_bignum()
+                content = self.read_bignum()
             case 'c':
-                return MarshalClassRef(self.read_byte_seq())
+                content = ClassRef(self.read_byte_seq())
             case 'm':
-                return MarshalModuleRef(self.read_byte_seq())
+                content = ModuleRef(self.read_byte_seq())
             case 'M':
-                return MarshalClassOrModuleRef(self.read_byte_seq())
+                content = ClassOrModuleRef(self.read_byte_seq())
             case 'd':
-                return self.read_data()
+                content = self.read_data()
             case 'f':
-                return self.read_float()
+                content = self.read_float()
             case '{':
-                return self.read_hash()
+                content = self.read_hash()
             case '}':
-                return self.read_default_hash()
+                content = self.read_default_hash()
             case 'o':
-                return self.read_gen_object()
+                content = self.read_gen_object()
             case '/':
-                return self.read_regex()
+                content = self.read_regex()
             case '"':
-                return MarshalString(self.read_byte_seq())
+                content = String(self.read_byte_seq())
             case 'S':
-                return self.read_struct()
+                content = self.read_struct()
             case 'C':
-                return self.read_user_class()
+                content = self.read_user_class()
             case 'u':
-                return self.read_user_data()
+                content = self.read_user_data()
             case 'U':
-                return self.read_user_object()
+                content = self.read_user_object()
             case _:
                 raise ParserError(
                     f"unrecognized object type code '{code}' at offset "
                     f"{self.offset()}"
                 )
+
+        return Node(self.result, content)
 
     def read_long(self) -> int:
         head = int.from_bytes(self.read_bytes(1), 'little', signed=True)
@@ -275,52 +843,32 @@ class Parser:
         length = self.read_long()
         return self.read_bytes(length)
 
-    def read_symbol_or_symbol_ref(self) -> MarshalNonToplevelObject:
-        result = self.read_object()
-
-        if not (
-            isinstance(result, MarshalSymbol)
-            or isinstance(result, MarshalSymbolRef)
-        ):
-            warn(
-                f"got an object of type '{type(result).__name__}' at offset "
-                f"{self.offset()}, but expected one of type 'MarshalSymbol' or"
-                "'MarshalSymbolRef'"
-            )
-
-        return result
-
-    def read_inst_vars(self) -> MarshalAlist:
+    def read_key_value_pairs(self) -> list[tuple[Node, Node]]:
         length = self.read_long()
-        result = []
+        result: list[tuple[Node, Node]] = []
 
         for _ in range(length):
-            name = self.read_symbol_or_symbol_ref()
+            name = self.read_object()
             value = self.read_object()
             result.append((name, value))
 
         return result
 
-    def read_object_with_inst_vars(self) -> MarshalInstVars:
-        obj = self.read_object()
-        inst_vars = self.read_inst_vars()
-        return MarshalInstVars(obj, inst_vars)
+    def read_object_with_inst_vars(self) -> InstVars:
+        child = self.read_object()
+        inst_vars = self.read_key_value_pairs()
+        return InstVars(child, inst_vars)
 
-    def read_object_with_module_ext(self) -> MarshalModuleExt:
-        module_ref = self.read_symbol_or_symbol_ref()
-        obj = self.read_object()
-        return MarshalModuleExt(module_ref, obj)
+    def read_object_with_module_ext(self) -> ModuleExt:
+        module = self.read_object()
+        child = self.read_object()
+        return ModuleExt(module, child)
 
-    def read_array(self) -> MarshalArray:
+    def read_array(self) -> Array:
         length = self.read_long()
-        result = []
-        
-        for _ in range(length):
-            result.append(self.read_object())
+        return Array([self.read_object() for _ in range(length)])
 
-        return MarshalArray(result)
-
-    def read_bignum(self) -> MarshalBignum:
+    def read_bignum(self) -> Bignum:
         sign_code = chr(self.read_byte())
         
         try:
@@ -335,14 +883,14 @@ class Parser:
         len_in_bytes = len_in_words * 2
         body = self.read_bytes(len_in_bytes)
         value = sign * int.from_bytes(body, 'little')
-        return MarshalBignum(value)
+        return Bignum(value)
 
-    def read_data(self) -> MarshalData:
-        class_ref = self.read_symbol_or_symbol_ref()
+    def read_data(self) -> Data:
+        klass = self.read_object()
         state = self.read_object()
-        return MarshalData(class_ref, state)
+        return Data(klass, state)
 
-    def read_float(self) -> MarshalFloat:
+    def read_float(self) -> Float:
         s = self.read_byte_seq().decode('latin-1')
         
         try:
@@ -367,74 +915,48 @@ class Parser:
             else:
                 value = locale.atof(s)
 
-        return MarshalFloat(value)
+        return Float(value)
 
-    def read_hash(self) -> MarshalHash:
-        length = self.read_long()
-        result = []
+    def read_hash(self) -> Hash:
+        result = self.read_key_value_pairs()
+        return Hash(result)
 
-        for _ in range(length):
-            key = self.read_object()
-            value = self.read_object()
-            result.append((key, value))
-
-        return MarshalHash(result)
-
-    def read_default_hash(self) -> MarshalDefaultHash:
-        base = self.read_hash()
+    def read_default_hash(self) -> DefaultHash:
+        items = self.read_key_value_pairs()
         default = self.read_object()
-        return MarshalDefaultHash(base.items, default)
+        return DefaultHash(items, default)
 
-    def read_gen_object(self) -> MarshalGenObject:
-        class_ref = self.read_symbol_or_symbol_ref()
-        inst_vars = self.read_inst_vars()
-        return MarshalGenObject(class_ref, inst_vars)
+    def read_gen_object(self) -> Object:
+        klass = self.read_object()
+        inst_vars = self.read_key_value_pairs()
+        return Object(klass, inst_vars)
 
-    REGEX_OPTIONS = [re.I, re.X, re.M]
-
-    def read_regex(self) -> MarshalRegex:
+    def read_regex(self) -> Regex:
         source = self.read_byte_seq()
-        bits = self.read_byte()
-        options = set()
+        options_byte = self.read_byte()
+        return Regex(source, options_byte)
 
-        for i in range(8):
-            bits, is_set = divmod(bits, 2)
-            
-            if is_set:
-                try:
-                    option = self.REGEX_OPTIONS[i]
-                except IndexError:
-                    warn(
-                        f"at offset {self.offset()}, regex options byte (value "
-                        f"{bits}) has {i}th bit set but this does not "
-                        "correspond to a recognized option"
-                    )
-                else:
-                    options.add(option)
+    def read_struct(self) -> Struct:
+        klass = self.read_object()
+        members = self.read_key_value_pairs()
+        return Struct(klass, members)
 
-        return MarshalRegex(source, options)
+    def read_user_class(self) -> UserClass:
+        klass = self.read_object()
+        child = self.read_object()
+        return UserClass(klass, child)
 
-    def read_struct(self) -> MarshalStruct:
-        class_ref = self.read_symbol_or_symbol_ref()
-        members = self.read_inst_vars()
-        return MarshalStruct(class_ref, members)
-
-    def read_user_class(self) -> MarshalUserClass:
-        class_ref = self.read_symbol_or_symbol_ref()
-        obj = self.read_object()
-        return MarshalUserClass(class_ref, obj)
-
-    def read_user_data(self) -> MarshalUserData:
-        class_ref = self.read_symbol_or_symbol_ref()
+    def read_user_data(self) -> UserData:
+        klass = self.read_object()
         data = self.read_byte_seq()
-        return MarshalUserData(class_ref, data)
+        return UserData(klass, data)
 
-    def read_user_object(self) -> MarshalUserObject:
-        class_ref = self.read_symbol_or_symbol_ref()
-        obj = self.read_object()
-        return MarshalUserObject(class_ref, obj)
+    def read_user_object(self) -> UserObject:
+        klass = self.read_object()
+        child = self.read_object()
+        return UserObject(klass, child)
 
-def parse_stream(stream: io.BufferedIOBase) -> MarshalFile:
+def parse_stream(stream: io.IOBase) -> MarshalFile:
     parser = Parser(stream)
     return parser.read_file()
 
@@ -442,487 +964,25 @@ def parse_file(path: Path) -> MarshalFile:
     with path.open('rb') as f:
         return parse_stream(f)
 
-def parse_bytes(content: bytes) -> MarshalFile:
-    return parse_stream(io.BytesIO(content))
-
-def marshal_object_can_be_object_ref_target(obj: MarshalObject) -> bool:
-    return isinstance(obj, (
-        MarshalArray, MarshalBignum, MarshalClassRef, MarshalModuleRef,
-        MarshalClassOrModuleRef, MarshalData, MarshalFloat, MarshalHash,
-        MarshalDefaultHash, MarshalGenObject, MarshalRegex, MarshalString,
-        MarshalStruct, MarshalUserClass, MarshalUserData, MarshalUserObject
-    ))
-
-def marshal_object_can_have_children(obj: MarshalObject) -> bool:
-    return isinstance(obj, (
-        MarshalArray, MarshalData, MarshalHash, MarshalDefaultHash, 
-        MarshalGenObject, MarshalStruct, MarshalUserClass, MarshalUserData,
-        MarshalUserObject
-    ))
-
-class CyclicRefHandler(Enum):
-    IGNORE = 0
-    FAIL = 1
-
-def expand_refs(
-    obj: MarshalObject, *,
-    cyclic_ref_handler: CyclicRefHandler=CyclicRefHandler.IGNORE,
-    symbols: list[MarshalSymbol | None] | None=None,
-    objects: list[MarshalNonRefObject | None] | None=None,
-    parents: set[int] | None=None,
-    keep_parent_id: bool=False
-) -> MarshalObject:
-    
-    if symbols is None:
-        symbols = []
-
-    if objects is None:
-        objects = []
-
-    if parents is None:
-        parents = set()
-
-    def recurse(obj, keep_parent_id=False):
-        return expand_refs(
-            obj,
-            cyclic_ref_handler=cyclic_ref_handler,
-            symbols=symbols,
-            objects=objects,
-            parents=parents,
-            keep_parent_id=keep_parent_id
-        )
-
-    if isinstance(obj, MarshalSymbol):
-        symbol_id = len(symbols)
-        symbols.append(obj)
-    elif marshal_object_can_be_object_ref_target(obj):
-        object_id = len(objects)
-        objects.append(None)
-
-        if marshal_object_can_have_children(obj):
-            parents.add(object_id)
-
-    result: MarshalObject
-
-    match obj:
-        case MarshalFile(version, root):
-            result = MarshalFile(version, recurse(root))
-        case MarshalSymbolRef(obj_id):
-            symbol = symbols[obj_id]
-            assert symbol is not None
-            result = symbol
-        case MarshalObjectRef(obj_id):
-            if obj_id in parents:
-                assert objects[obj_id] is None
-                match cyclic_ref_handler:
-                    case CyclicRefHandler.IGNORE:
-                        result = obj
-                    case CyclicRefHandler.FAIL:
-                        raise ParserError(f"cyclic reference to ID {obj_id}")
-            else:
-                deref = objects[obj_id]
-                assert deref is not None
-                result = deref
-        case MarshalInstVars(obj, inst_vars):
-            object_id = len(objects)
-            obj_result = recurse(obj, keep_parent_id=True)
-            new_inst_vars = []
-
-            for name, value in inst_vars:
-                new_inst_vars.append((recurse(name), recurse(value)))
-
-            result = MarshalInstVars(obj_result, new_inst_vars)
-
-            if marshal_object_can_be_object_ref_target(obj):
-                objects[object_id] = result
-
-            if marshal_object_can_have_children(obj):
-                parents.remove(object_id)
-        case MarshalModuleExt(module_ref, obj):
-            object_id = len(objects)
-            result = MarshalModuleExt(recurse(module_ref), recurse(obj))
-
-            if marshal_object_can_be_object_ref_target(obj):
-                objects[object_id] = result
-        case MarshalArray(items):
-            result = MarshalArray(list(map(recurse, items)))
-        case MarshalData(class_ref, state):
-            result = MarshalData(recurse(class_ref), recurse(state))
-        case MarshalHash(items):
-            new_items = []
-
-            for key, value in items:
-                new_items.append((recurse(key), recurse(value)))
-
-            result = MarshalHash(new_items)
-        case MarshalDefaultHash(items, default):
-            new_items = []
-
-            for key, value in items:
-                new_items.append((recurse(key), recurse(value)))
-
-            result = MarshalDefaultHash(new_items, recurse(default))
-        case MarshalGenObject(class_ref, inst_vars):
-            class_ref = recurse(class_ref)
-            new_inst_vars = []
-
-            for name, value in inst_vars:
-                new_inst_vars.append((recurse(name), recurse(value)))
-
-            result = MarshalGenObject(class_ref, new_inst_vars)
-        case MarshalStruct(class_ref, members):
-            class_ref = recurse(class_ref)
-            new_members = []
-
-            for name, value in members:
-                new_members.append((recurse(name), recurse(value)))
-
-            result = MarshalStruct(class_ref, new_members)
-        case MarshalUserClass(class_ref, obj):
-            result = MarshalUserClass(recurse(class_ref), recurse(obj))
-        case MarshalUserData(class_ref, data):
-            result = MarshalUserData(recurse(class_ref), data)
-        case MarshalUserObject(class_ref, obj):
-            result = MarshalUserObject(recurse(class_ref), recurse(obj))
-        case _:
-            result = obj
-    
-    if marshal_object_can_be_object_ref_target(obj):
-        if marshal_object_can_have_children(obj) and not keep_parent_id:
-            parents.remove(object_id)
-
-        assert isinstance(result, MarshalNonRefObject)
-        objects[object_id] = result
-
-    return result
-
-# compress module ext and inst vars into one
-
-@dataclass
-class Options:
-    distinguish_bignums: bool=False
-    distinguish_symbols: bool=False
-    preserve_inst_var_order: bool=False
-    preserve_cyclic_refs: bool=False
-    preserve_refs: bool=False # implies preserve_cyclic_refs
-    preserve_encodings: bool=False
-
-JsonDumpable = (
-    None | bool | int | float | str
-    | list['JsonDumpable']
-    | tuple['JsonDumpable', ...]
-    | dict[str, 'JsonDumpable']
-)
-
-def interpret_marshal_object_as_encoding(obj: MarshalObject) -> str:
-    match obj:
-        case MarshalTrue():
-            return 'utf-8'
-        case MarshalFalse():
-            return 'us-ascii'
-        case MarshalString(value):
-            # hopefully the ruby strings and the python strings are compatible
-            try:
-                b'\x00'.decode(value)
-            except LookupError:
-                raise ParserError(f"Ruby encoding string '{value}' is not understood by Python")
-
-            return value
-        case _:
-            raise ParserError(f"object {obj} can't be interpreted as an encoding")
-
-def to_json_dumpable_without_expanding_refs(
-    obj: MarshalObject, options: Options, encoding: str | None=None
-) -> JsonDumpable:
-
-    def recurse(obj: MarshalObject, encoding: str | None=None) -> JsonDumpable:
-        return to_json_dumpable_without_expanding_refs(obj, options, encoding)
-
-    match obj:
-        case MarshalFile(version, root):
-            return {'version': str(version), 'root': recurse(root)}
-        case MarshalNil():
-            return None
-        case MarshalTrue():
-            return True
-        case MarshalFalse():
-            return False
-        case MarshalFixnum(value):
-            return value
-        case MarshalSymbol(name):
-            if encoding is None:
-                result = name.decode('utf-8', 'surrogateescape')
-            else:
-                result = name.decode(encoding)
-
-            if options.distinguish_symbols:
-                return {
-                    'type': 'symbol',
-                    'name': result
-                }
-            else:
-                return result
-        case MarshalSymbolRef(value):
-            return {'type': 'symbol-ref', 'value': value}
-        case MarshalObjectRef(value):
-            return {'type': 'object-ref', 'value': value}
-        case MarshalInstVars(obj, inst_vars):
-            if not options.preserve_encodings:
-                new_inst_vars = []
-
-                for name, value in inst_vars:
-                    match name:
-                        case MarshalSymbol(b'E'):
-                            encoding = interpret_marshal_object_as_encoding(value)
-                        case _:
-                            new_inst_vars.append((name, value))
-
-                inst_vars = new_inst_vars
-
-            if not inst_vars:
-                return recurse(obj, encoding)
-
-            if options.preserve_inst_var_order:
-                inst_vars = [
-                    (recurse(name), recurse(value))
-                    for name, value in inst_vars
-                ]
-            else:
-                inst_vars = {
-                    recurse(name): recurse(value) for name, value in inst_vars
-                }
-
-            return {
-                'type': 'inst-vars',
-                'base': recurse(obj, encoding),
-                'inst_vars': inst_vars
-            }
-        case MarshalModuleExt(module_ref, obj):
-            return {
-                'type': 'module-ext',
-                'module': recurse(module_ref),
-                'base': recurse(obj)
-            }
-        case MarshalArray(items):
-            return [recurse(item) for item in items]
-        case MarshalBignum(value):
-            if options.distinguish_bignums:
-                return {'type': 'bignum', 'value': value}
-            else:
-                return value
-        case MarshalClassRef(name):
-            return {'type': 'class-ref', 'value': name.decode('utf-8', 'surrogateescape')}
-        case MarshalModuleRef(name):
-            return {'type': 'module-ref', 'value': name.decode('utf-8', 'surrogateescape')}
-        case MarshalClassOrModuleRef(name):
-            return {'type': 'class-or-module-ref', 'value': name.decode('utf-8', 'surrogateescape')}
-        case MarshalData(class_ref, state):
-            return {
-                'type': 'data', 
-                'class': recurse(class_ref), 
-                'state': recurse(state)
-            }
-        case MarshalFloat(value):
-            return value
-        case MarshalHash(items):
-            return {
-                'type': 'hash',
-                'items': [
-                    (recurse(key), recurse(value))
-                    for key, value in items
-                ]
-            }
-        case MarshalDefaultHash(items, default):
-            return {
-                'type': 'default-hash',
-                'items': [
-                    (recurse(key), recurse(value))
-                    for key, value in items
-                ],
-                'default': recurse(default),
-            }
-        case MarshalGenObject(class_ref, inst_vars):
-            if options.preserve_inst_var_order:
-                inst_vars = [
-                    (recurse(name), recurse(value))
-                    for name, value in inst_vars
-                ]
-            else:
-                inst_vars = {
-                    recurse(name): recurse(value) for name, value in inst_vars
-                }
-
-            return {
-                'type': 'gen-object',
-                'class_ref': recurse(class_ref),
-                'inst_vars': inst_vars
-            }
-        case MarshalRegex(source, regex_opts):
-            if encoding is None:
-                source = source.decode('utf-8', 'surrogateescape')
-            else:
-                source = source.decode(encoding)
-
-            return {
-                'type': 'regex',
-                'source': source,
-                'options': [option.name for option in sorted(regex_opts)]
-            }
-        case MarshalString(value):
-            if encoding is None:
-                return value.decode('utf-8', 'surrogateescape')
-            else:
-                return value.decode(encoding)
-        case MarshalStruct(class_ref, members):
-            if options.preserve_inst_var_order:
-                members = [
-                    (recurse(name), recurse(value))
-                    for name, value in members
-                ]
-            else:
-                members = {
-                    recurse(name): recurse(value) for name, value in members
-                }
-
-            return {
-                'type': 'struct',
-                'class': recurse(class_ref),
-                'members': members
-            }
-        case MarshalUserClass(class_ref, obj):
-            return {
-                'type': 'user-class',
-                'class': recurse(class_ref),
-                'base': recurse(obj)
-            }
-        case MarshalUserData(class_ref, data):
-            return {
-                'type': 'user-data',
-                'class': recurse(class_ref),
-                'data': data.decode('utf-8', 'surrogateescape')
-            }
-        case MarshalUserObject(class_ref, obj):
-            return {
-                'type': 'user-object',
-                'class': recurse(class_ref),
-                'base': recurse(obj)
-            }
-        case _:
-            raise ValueError(
-                f"cannot convert object of type '{type(obj).__name__}' to "
-                "JsonDumpable"
-            )
-
-            return {}
-
-def to_json_dumpable(obj: MarshalObject, options: Options) -> JsonDumpable:
-    if not options.preserve_refs:
-        obj = expand_refs(obj, cyclic_ref_handler=(
-            CyclicRefHandler.IGNORE if options.preserve_cyclic_refs
-            else CyclicRefHandler.FAIL
-        ))
-
-    return to_json_dumpable_without_expanding_refs(obj, options)
-
-def to_json(obj: MarshalObject, options: Options) -> str:
-    return json.dumps(to_json_dumpable(obj, options))
-
-def main(
-    input_file: Path, output_file: Path, *,
-    overwrite: bool=False, distinguish_bignums: bool=False,
-    distinguish_symbols: bool=False, preserve_cyclic_refs: bool=False,
-    preserve_refs: bool=False, preserve_encodings: bool=False,
-    preserve_inst_var_order: bool=False
-) -> None:
-
-    options = Options(
-        distinguish_bignums=distinguish_bignums,
-        distinguish_symbols=distinguish_symbols,
-        preserve_cyclic_refs=preserve_cyclic_refs,
-        preserve_refs=preserve_refs,
-        preserve_encodings=preserve_encodings,
-        preserve_inst_var_order=preserve_inst_var_order
-    )
-
-    parsed_content = parse_file(input_file)
-    json_content = to_json(parsed_content, options)
-    output_file = output_file.absolute()
-
-    if not overwrite and output_file.exists():
-        print(
-            f'File "{output_file}" already exists. Use the -o option to overwrite '
-            'existing files.'
-        )
-        
-        sys.exit(1)
-
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-
-    with output_file.open('w') as ofh:
-        ofh.write(json_content)
 
 if __name__ == '__main__':
     import argparse
+    import json
 
     arg_parser = argparse.ArgumentParser(
         prog='ruby_marshal_parser',
-        description="Parses files produced by Ruby's Marshal.dump function."
+        description='Parses Ruby Marshal data files.'
     )
 
     arg_parser.add_argument('input_file', type=Path)
     arg_parser.add_argument('output_file', type=Path)
-
-    arg_parser.add_argument('-o', '--overwrite', action='store_true', help=(
-        'overwrite the output file if it already exists'
-    ))
-
-    arg_parser.add_argument(
-        '-b', '--distinguish-bignums', action='store_true', help=(
-            'preserve the distinction between fixnums and bignums in the output'
-        )
-    )
-
-    arg_parser.add_argument(
-        '-s', '--distinguish-symbols', action='store_true', help=(
-            'preserve the distinction between strings and symbols in the output'
-        )
-    )
-    
-    arg_parser.add_argument(
-        '-c', '--preserve-cyclic-refs', action='store_true', help=(
-            'instead of raising an error when encountering an object '
-            'reference that would result in a cycle, just don\'t expand those '
-            'references'
-        )
-    )
-    
-    arg_parser.add_argument('-p', '--preserve-refs', action='store_true', help=(
-        'don\'t expand symbol and object references at all'
-    ))
-
-    arg_parser.add_argument(
-        '-e', '--preserve-encodings', action='store_true', help=(
-            'don\'t decode symbols and strings using the encodings supplied via'
-            'instance variables'
-        )
-    )
-
-    arg_parser.add_argument(
-        '-i', '--preserve-inst-var-order', action='store_true', help=(
-            'encode instance variable lists as ordered lists of tuples rather '
-            'than as dictionaries'
-        )
-    )
-
     parsed_args = arg_parser.parse_args()
+
+    with parsed_args.input_file.open('rb') as f:
+        raw_tree = parse_stream(f)
+
+    json_tree = json.dumps(raw_tree.to_json_dumpable(), indent=2)
+
+    with parsed_args.output_file.open('w') as f:
+        f.write(json_tree)
     
-    main(
-        parsed_args.input_file, parsed_args.output_file,
-        overwrite=parsed_args.overwrite,
-        distinguish_bignums=parsed_args.distinguish_bignums,
-        distinguish_symbols=parsed_args.distinguish_symbols,
-        preserve_cyclic_refs=parsed_args.preserve_cyclic_refs,
-        preserve_refs=parsed_args.preserve_refs,
-        preserve_encodings=parsed_args.preserve_encodings,
-        preserve_inst_var_order=parsed_args.preserve_inst_var_order
-    )

@@ -1,3 +1,11 @@
-env
-*.pyc
-__pycache__
+__pycache__/
+*.py[cod]
+.mypy_cache/
+
+env/
+dist/
+dist/
+
+scratch/
+
+test-output.txt
