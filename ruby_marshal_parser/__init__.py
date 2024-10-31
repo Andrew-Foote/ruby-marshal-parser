@@ -61,134 +61,12 @@ class MarshalFile:
         ]
 
     def to_json_dumpable(self) -> JsonDumpable:
-        parents: dict[Node, int] = {}
-
-        def recurse(node: Node) -> JsonDumpable:
-            result: dict[str, JsonDumpable] = {}
-
-            node = node.deref
-
-            if node in parents:
-                return {'type': 'parent-ref', 'value': parents[node]}
-            
-            parents[node] = len(parents)
-
-            if node.module_ext:
-                result['module_ext'] = node.module_ext
-
-            content = node.body_content
-
-            match content:
-                case True_():
-                    result['type'] = 'true'
-                    result['value'] = True
-                case False_():
-                    result['type'] = 'false'
-                    result['value'] = False
-                case Nil():
-                    result['type'] = 'nil'
-                    result['value'] = None
-                case Fixnum(value):
-                    result['type'] = 'fixnum'
-                    result['value'] = value
-                case Symbol():
-                    result['type'] = 'symbol'
-                    result['value'] = node.decoded_text
-                case Array(items):
-                    result['type'] = 'array'
-                    result['value'] = list(map(recurse, items))
-                case Bignum(value):
-                    result['type'] = 'bignum'
-                    result['value'] = value
-                case ClassRef():
-                    result['type'] = 'class-ref'
-                    result['value'] = node.decoded_text
-                case ModuleRef():
-                    result['type'] = 'module-ref'
-                    result['value'] = node.decoded_text
-                case ClassOrModuleRef():
-                    result['type'] = 'class-or-module-ref'
-                    result['value'] = node.decoded_text
-                case Data(class_name=klass, state=state):
-                    result['type'] = 'data'
-                    result['class'] = klass
-                    result['state'] = recurse(state)
-                case Float(value):
-                    result['type'] = 'float'
-                    result['value'] = value
-                case Hash(items):
-                    result['type'] = 'hash'
-                    
-                    result['value'] = [
-                        (recurse(key), recurse(value)) for key, value in items
-                    ]
-                case DefaultHash(items, default):
-                    result['type'] = 'hash'
-                    
-                    result['value'] = [
-                        (recurse(key), recurse(value)) for key, value in items
-                    ]
-
-                    result['default'] = recurse(default)
-                case Object(class_name=klass):
-                    result['type'] = 'object'
-                    result['class'] = klass
-                case Regex(options=options):
-                    result['type'] = 'regex'
-                    result['source'] = node.decoded_text
-                    result['options'] = [option.value for option in options]
-                case String():
-                    result['type'] = 'string'
-                    result['value'] = node.decoded_text
-                case Struct(class_name=klass):
-                    result['type'] = 'struct'
-                    result['class'] = klass
-                case UserClass(class_name=klass, child=child):
-                    result['type'] = 'user-class'
-                    result['class'] = klass
-                    result['child'] = recurse(child)
-                case UserData(class_name=klass, data=data):
-                    result['type'] = 'user-data'
-                    result['class'] = klass
-                    result['data'] = data.decode('latin-1')
-                case UserObject(class_name=klass, child=child):
-                    result['type'] = 'user-object'
-                    result['class'] = klass
-                    result['child'] = recurse(child)
-                case _:
-                    assert False, (
-                        f'unrecognized node type: {type(content).__name__}'
-                    )
-
-            result['inst_vars'] = {
-                name: recurse(value)
-                for name, value in node.inst_vars.items()
-                if name != 'E'
-            }
-
-            del parents[node]
-
-            if not result['inst_vars']:
-                del result['inst_vars']
-
-            if (
-                result['type'] in (
-                    'nil', 'true', 'false', 'fixnum', 'array', 'float', 'string'
-                )
-                and 'module_ext' not in result and 'inst_vars' not in result
-            ):
-                actual_result = result['value']
-            else:
-                actual_result = result
-
-            return actual_result
-
         if self.content is None:
             assert False, 'MarshalFile not initialized'
 
         return {
             'version': str(self.version),
-            'content': recurse(self.content)
+            'content': self.content.to_json_dumpable()
         }
 
 @dataclass(eq=False)
@@ -513,6 +391,131 @@ class Node:
                     f'{type(content).__name__}'
                 )
 
+    def to_json_dumpable(self, parents: dict[Node, int] | None=None):
+        if parents is None:
+            parents = {}
+
+        def recurse(node):
+            return node.to_json_dumpable(parents)
+
+        result: dict[str, JsonDumpable] = {}
+
+        node = self.deref
+
+        if node in parents:
+            return {'type': 'parent-ref', 'value': parents[node]}
+        
+        parents[node] = len(parents)
+
+        if node.module_ext:
+            result['module_ext'] = node.module_ext
+
+        content = node.body_content
+
+        match content:
+            case True_():
+                result['type'] = 'true'
+                result['value'] = True
+            case False_():
+                result['type'] = 'false'
+                result['value'] = False
+            case Nil():
+                result['type'] = 'nil'
+                result['value'] = None
+            case Fixnum(value):
+                result['type'] = 'fixnum'
+                result['value'] = value
+            case Symbol():
+                result['type'] = 'symbol'
+                result['value'] = node.decoded_text
+            case Array(items):
+                result['type'] = 'array'
+                result['value'] = list(map(recurse, items))
+            case Bignum(value):
+                result['type'] = 'bignum'
+                result['value'] = value
+            case ClassRef():
+                result['type'] = 'class-ref'
+                result['value'] = node.decoded_text
+            case ModuleRef():
+                result['type'] = 'module-ref'
+                result['value'] = node.decoded_text
+            case ClassOrModuleRef():
+                result['type'] = 'class-or-module-ref'
+                result['value'] = node.decoded_text
+            case Data(class_name=klass, state=state):
+                result['type'] = 'data'
+                result['class'] = klass
+                result['state'] = recurse(state)
+            case Float(value):
+                result['type'] = 'float'
+                result['value'] = value
+            case Hash(items):
+                result['type'] = 'hash'
+                
+                result['value'] = [
+                    (recurse(key), recurse(value)) for key, value in items
+                ]
+            case DefaultHash(items, default):
+                result['type'] = 'hash'
+                
+                result['value'] = [
+                    (recurse(key), recurse(value)) for key, value in items
+                ]
+
+                result['default'] = recurse(default)
+            case Object(class_name=klass):
+                result['type'] = 'object'
+                result['class'] = klass
+            case Regex(options=options):
+                result['type'] = 'regex'
+                result['source'] = node.decoded_text
+                result['options'] = [option.value for option in options]
+            case String():
+                result['type'] = 'string'
+                result['value'] = node.decoded_text
+            case Struct(class_name=klass):
+                result['type'] = 'struct'
+                result['class'] = klass
+            case UserClass(class_name=klass, child=child):
+                result['type'] = 'user-class'
+                result['class'] = klass
+                result['child'] = recurse(child)
+            case UserData(class_name=klass, data=data):
+                result['type'] = 'user-data'
+                result['class'] = klass
+                result['data'] = data.decode('latin-1')
+            case UserObject(class_name=klass, child=child):
+                result['type'] = 'user-object'
+                result['class'] = klass
+                result['child'] = recurse(child)
+            case _:
+                assert False, (
+                    f'unrecognized node type: {type(content).__name__}'
+                )
+
+        result['inst_vars'] = {
+            name: recurse(value)
+            for name, value in node.inst_vars.items()
+            if name != 'E'
+        }
+
+        del parents[node]
+
+        if not result['inst_vars']:
+            del result['inst_vars']
+
+        if (
+            result['type'] in (
+                'nil', 'true', 'false', 'fixnum', 'array', 'float', 'string'
+            )
+            and 'module_ext' not in result and 'inst_vars' not in result
+        ):
+            actual_result = result['value']
+        else:
+            actual_result = result
+
+        return actual_result
 
 @dataclass(eq=False)
 class True_(NodeData):
