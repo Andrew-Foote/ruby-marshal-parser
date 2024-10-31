@@ -10,7 +10,7 @@ authors = [
 ]
 description = "A parser for Ruby's Marshal serialisation format"
 readme = "README.md"
-requires-python = ">=3.12.3"
+requires-python = ">=3.14.0a1"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
@@ -22,3 +22,12 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/Andrew-Foote/ruby-marshal-parser"
 Issues = "https://github.com/Andrew-Foote/ruby-marshal-parser/issues"
+
+[project.optional-dependencies]
+test = [
+    "mypy",
+    "pytest",
+]
+
+[pytest]
+testpaths = ["tests"]
