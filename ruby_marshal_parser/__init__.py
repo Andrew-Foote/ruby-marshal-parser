@@ -6,7 +6,7 @@ import locale
 import math
 from pathlib import Path
 import re
-from typing import Callable, Literal, Iterator, Sequence, Mapping
+from typing import assert_never, Callable, Literal, Iterator, Sequence, Mapping
 from warnings import warn
 
 
@@ -41,6 +41,9 @@ class MarshalVersion:
 class MarshalFile:
     version: MarshalVersion=MarshalVersion(0, 0)
     content: 'Node | None'=None
+
+    def __str__(self) -> str:
+        return str(self.to_json_dumpable())
 
     @ft.cached_property
     def symbols(self) -> list['Node']:
@@ -104,6 +107,9 @@ class Node:
     content: NodeData
 
     __match_args__ = 'body_type_and_content', 'inst_vars', 'module_ext'
+
+    def __str__(self) -> str:
+        return str(self.to_json_dumpable())
 
     def children(self) -> Iterator['Node']:
         """Returns an iterator over the node's immediate children.
