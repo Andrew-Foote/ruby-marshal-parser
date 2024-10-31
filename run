@@ -1,1 +1,1 @@
-env/bin/python -m ruby_marshal_parser "$1" "$2"
+env/bin/python -m ruby_marshal_parser ${1+"$1"} ${2+"$2"}

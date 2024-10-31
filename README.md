@@ -93,3 +93,5 @@ I've tried to make the program work nicely with Python's pattern-matching syntax
 				scroll_x=scroll_x,
 				scroll_y=scroll_y
 			)
+
+(Note: this syntax unfortunately doesn't work well with Mypy, as Mypy seems to be unable to deduce that the variables captured via the match are attributes of the specific node type being matched against, so e.g. in the example above, mypy will be unable to deduce that `name` is definitely a `str`, rather than something else such as an `int`.)

@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "ruby_marshal_parser"
 version = "0.0.1"
 authors = [
-  { name="Andrew Foote", email="footeandrew1@gmail.com" },
+    { name="Andrew Foote", email="footeandrew1@gmail.com" },
 ]
 description = "A parser for Ruby's Marshal serialisation format"
 readme = "README.md"
@@ -15,8 +15,8 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
     "Operating System :: OS Independent",
-	"Development Status :: 1 - Planning",
-	"Typing :: Typed",
+    "Development Status :: 1 - Planning",
+    "Typing :: Typed",
 ]
 
 [project.urls]
