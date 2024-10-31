@@ -29,5 +29,9 @@ test = [
     "pytest",
 ]
 
+[tool.mypy]
+packages = ["ruby_marshal_parser", "tests"]
+
 [pytest]
 testpaths = ["tests"]
+

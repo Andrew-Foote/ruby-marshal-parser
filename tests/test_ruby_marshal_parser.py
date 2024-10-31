@@ -3,18 +3,19 @@ import importlib.resources
 import json
 from pathlib import Path
 import pytest
+from _pytest.fixtures import FixtureRequest
 import ruby_marshal_parser as marshal
 
 @ft.cache
-def golden_path():
+def golden_path() -> Path:
 	with importlib.resources.path('ruby_marshal_parser') as base_path:
-		return base_path.parent / 'tests/golden'
+		return base_path.parent / 'golden'
 
 @pytest.fixture
-def update_golden_inputs(request):
+def update_golden_inputs(request: FixtureRequest) -> bool:
 	return request.config.getoption('--update-golden')
 
-def test_to_json_dumpable(update_golden_inputs):
+def test_to_json_dumpable(update_golden_inputs: bool) -> None:
 	inputs_tested = set()
 
 	for input_path in (golden_path() / 'inputs').iterdir():
