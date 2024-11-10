@@ -316,7 +316,7 @@ class Node:
             )
 
         encoding = self.encoding()
-        return content.text.decode('latin-1' if encoding is None else encoding)
+        return content.text.decode('utf-8' if encoding is None else encoding)
 
     @property
     def body_type_and_content(self) -> NodeBodyTypeAndContent:
