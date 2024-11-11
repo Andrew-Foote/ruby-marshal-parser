@@ -316,7 +316,11 @@ class Node:
             )
 
         encoding = self.encoding()
-        return content.text.decode('utf-8' if encoding is None else encoding)
+
+        if encoding is None:
+            return content.text.decode('utf-8', 'surrogateescape')
+        else:
+            return content.text.decode(encoding)
 
     @property
     def body_type_and_content(self) -> NodeBodyTypeAndContent:

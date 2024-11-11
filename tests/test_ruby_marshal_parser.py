@@ -19,10 +19,14 @@ def test_to_json_dumpable(update_golden_inputs: bool) -> None:
 	inputs_tested = set()
 
 	for input_path in (golden_path() / 'inputs').iterdir():
-		output = json.dumps(
-			marshal.parse_file(input_path).to_json_dumpable(),
-			indent=2
-		)
+		try:
+			output = json.dumps(
+				marshal.parse_file(input_path).to_json_dumpable(),
+				indent=2
+			)
+		except Exception as e:
+			e.add_note(str(input_path))
+			raise
 
 		output_path = golden_path() / f'outputs/{input_path.name}'
 

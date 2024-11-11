@@ -339,7 +339,7 @@
           "type": "object",
           "class": "RPG::MapInfo",
           "inst_vars": {
-            "@name": "Castillo De \u00c3\u0081ngel",
+            "@name": "Castillo De \u00c1ngel",
             "@parent_id": 147,
             "@order": 0,
             "@expanded": false,
@@ -1044,7 +1044,7 @@
           "type": "object",
           "class": "RPG::MapInfo",
           "inst_vars": {
-            "@name": "Castillo De la \u00c3\u0081ngel",
+            "@name": "Castillo De la \u00c1ngel",
             "@parent_id": 172,
             "@order": 0,
             "@expanded": false,
@@ -1614,7 +1614,7 @@
           "type": "object",
           "class": "RPG::MapInfo",
           "inst_vars": {
-            "@name": "Pok\u00c3\u00a9 Mart",
+            "@name": "Pok\u00e9 Mart",
             "@parent_id": 105,
             "@order": 0,
             "@expanded": false,
@@ -2199,7 +2199,7 @@
           "type": "object",
           "class": "RPG::MapInfo",
           "inst_vars": {
-            "@name": "Castillo De \u00c3\u0081ngel",
+            "@name": "Castillo De \u00c1ngel",
             "@parent_id": 191,
             "@order": 0,
             "@expanded": false,
@@ -2214,7 +2214,7 @@
           "type": "object",
           "class": "RPG::MapInfo",
           "inst_vars": {
-            "@name": "Castillo De la \u00c3\u0081ngel",
+            "@name": "Castillo De la \u00c1ngel",
             "@parent_id": 172,
             "@order": 0,
             "@expanded": false,
@@ -2574,7 +2574,7 @@
           "type": "object",
           "class": "RPG::MapInfo",
           "inst_vars": {
-            "@name": "Castillo De \u00c3\u0081ngel",
+            "@name": "Castillo De \u00c1ngel",
             "@parent_id": 23,
             "@order": 0,
             "@expanded": false,
